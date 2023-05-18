@@ -1,0 +1,659 @@
+#pragma rtGlobals=1		// Use modern global access method.
+//----------------------------------------------------------------------------------------------------------------------------//
+// Gets binary data from *.dat file, and calibration info from corresponding *.cal file
+// This version modified on 2/12/2019 by Chip to load data from the new dual-trap force-clamp program
+macro LoadDualTrapData()
+  DoWindow /k table0 // gets rid of that pesky table0 window
+  GBLoadWave/N/I/W=9/V=1/T={4,4}
+  Newpath/O datapath,S_path
+  duplicate/o wave0,bX1
+  duplicate/o wave1,bY1
+  duplicate/o wave2,bX2
+  duplicate/o wave3,bY2
+  duplicate/o wave4,sX1
+  duplicate/o wave5,sX2
+  duplicate/o wave6,tip1
+  duplicate/o wave7,tip2
+  duplicate/o wave8,flags
+  LoadWave/T/P=datapath/W S_fileName[0,strlen(S_fileName) - 5]+".cal" // for new IGOR text *.cal files 
+  make/n=1/t filename // added by chip 15_1202 so that filename is stored for later use
+  filename = S_fileName[0,strlen(S_fileName) - 5] // added by chip 15_1202 so that filename is stored for later use
+  endcomments[0]=noCRLF(endcomments[0])
+  SetScale/P x 0,(1/datarate[0]),"", bX1,bY1,bX2,bY2,sX1,sX2,tip1,tip2,flags
+  GetFlags()
+  print endcomments[0]
+  
+  SetupForceClampAnalysisDualTrap()
+  data_process()
+  
+  doWindow/F 'ForceOverTime'
+  doWindow/F 'StagePos'
+  
+end
+//-------------------------------------------------------------------
+
+function SetupForceClampAnalysisDualTrap()
+  variable/G EventNumber = 1   // global variable specifying which event we're looking at now
+  variable/G TotalEvents = 0  // global variable for total number of events
+  initialize_analysis()  
+end
+
+//---------------------------------------------------------------------------
+// Bonni's functions for processing waves
+// 
+function data_process()
+	trim_data()
+	tip_positions()
+	are_we_a_go()
+	beads()
+	tip_forces()
+	tip_separation()
+	velocities()
+//	make_layout()
+end
+
+//----------------------------------------------------------------------------------
+// Cuts out measurements when the tips weren't coupled or the traps weren't triggered
+function trim_data()
+	variable i,counter // counters
+	counter = 0
+	wave tip1,tip2,bX1,bX2,bY1,bY2
+	wave trigger1,trigger2,coupled
+	make/o/n=(numpnts(tip1)) tip1c,tip2c,bX1c,bX2c,bY1c,bY2c
+	
+	// change wave scaling to match original data
+	SetScale/P x 0,0.005,"", tip1c 
+	SetScale/P x 0,0.005,"", tip2c
+	SetScale/P x 0,0.005,"", bX1c
+	SetScale/P x 0,0.005,"", bX2c
+
+	// tip positions cut so to only include time when the tips were coupled and both were attached to Dam1 beads
+	for(i=0;i<numpnts(tip1);i++)
+		if(coupled[i]==1 && trigger1[i]==1 && trigger2[i]==1)
+			tip1c[counter] = tip1[i]
+			tip2c[counter] = tip2[i]
+			bX1c[counter] = bX1[i]
+			bX2c[counter] = bX2[i]
+			bY1c[counter] = bY1[i]
+			bY2c[counter] = bY2[i]
+			counter += 1
+		endif
+	endfor
+	deletepoints counter,numpnts(tip1)-counter,tip1c
+	deletepoints counter,numpnts(tip2)-counter,tip2c
+	deletepoints counter,numpnts(bX1)-counter,bX1c
+	deletepoints counter,numpnts(bX2)-counter,bX2c
+	deletepoints counter,numpnts(bY1)-counter,bY1c
+	deletepoints counter,numpnts(bY2)-counter,bY2c
+end
+
+//-----------------------------------------------------------------
+// Graphs tip positions over time
+
+function tip_positions()
+	// tip position graph
+	doWindow/z/k StagePos
+	display tip1c,tip2c
+	SetAxis/A
+	ModifyGraph width=0,height=0
+	ModifyGraph lsize=1,rgb=(0,0,0)
+	ModifyGraph rgb(tip1c)=(65280,0,0),rgb(tip2c)=(0,12800,52224)
+	Label left "Tip position (nm)"
+	Label bottom "Time (s)"
+	doWindow/C $"StagePos"
+end
+	
+//--------------------------------------------------------------------------
+// Displays when the two tips are coupled together in the model
+// Also displays when the trap 1 and 2 have been triggered
+
+function are_we_a_go()	
+	display coupled
+	SetAxis left -1,6
+	appendtograph trigger1, trigger2
+	ModifyGraph rgb(coupled)=(0,0,0),rgb(trigger1)=(65280,0,0);
+	ModifyGraph rgb(trigger2)=(0,12800,52224)
+	ModifyGraph offset(trigger1)={0,2},offset(trigger2)={0,4}
+	SetAxis/A bottom 
+	Label left "Flags"
+	ModifyGraph mirror=2
+	ModifyGraph grid(left)=2,gridRGB(left)=(0,0,0)
+	Label bottom "Time [s]"
+	
+	// Make labels
+	DrawText 0.820454545454545,0.0934579439252336,"trigger 2"
+	DrawText 0.823636363636364,0.4,"trigger 1"
+	DrawText 0.821363636363636,0.794392523364486,"Coupled"
+
+end
+
+//-----------------------------------------------------------
+// graphs bead position along with smoothed bead position, adjusted for unloaded position
+function beads()
+	wave bX1c,bX2c,unloaded_positions
+	variable i // counter
+	
+	// Flips sign of force to tension for events
+	if(mean(bX1c) < 0)
+		bX1c = -bX1c
+		unloaded_positions[0] *=-1 // flips corresponding unloaded
+	endif
+	if(mean(bX2c) < 0)
+		bX2c = -bX2c
+		unloaded_positions[1] *= -1
+	endif
+		
+	duplicate bx1c,bx1c_unloaded
+	duplicate bx2c,bx2c_unloaded
+	
+	bX1c_unloaded -= unloaded_positions[0]
+	bX2c_unloaded -= unloaded_positions[1]
+	
+	duplicate/o bX1c_unloaded,sbX1c
+	duplicate/o bX2c_unloaded,sbX2c
+	Smooth/b=1 100, sbX1c, sbX2c
+	
+	// graph
+	doWindow/z/k BTSep
+	display bX1c_unloaded,bX2c_unloaded,sbX1c,sbX2c 
+	Label left "Bead position [nm]"
+	Label bottom "Time [s]"
+	ModifyGraph rgb(bX1c_unloaded)=(65535,49151,49151),rgb(sbX1c)=(65535,0,0)
+   ModifyGraph rgb(bX2c_unloaded)=(49151, 53155,65535),rgb(sbX2c)=(1,16019,65535)
+   DoWindow /C $"BTSep" // renames this graph "BTSep"
+
+end
+
+//-----------------------------------------------------
+// calculates and plots force on each tip
+function tip_forces()
+	wave sbX1c,sbX2c,kx1,kx2
+	// Calculates force on bead (force = trap  stiffness times bead displacement)
+	duplicate/o sbX1c,sF1 // bead displacement
+	duplicate/o sbX2c,sF2 
+
+	// this is where I would correct for actual unloaded bead position
+
+	sF1*=kx1[0] // bead displacement times trap stiffness
+	sF2*=kx2[0] 
+	
+	// Calculate total force
+	duplicate/o sF1,sFtot
+	sFtot = sF1 + sF2
+	
+	// graphs force over time
+	doWindow/k/z ForceOverTime
+	display sF1,sF2,sFtot
+	ModifyGraph rgb(sF1)=(65280,0,0),rgb(sF2)=(0,12800,52224),rgb(sFtot)=(0,0,0)
+	Label left "Force [pN]"
+	Label bottom "Time [s]"
+	ModifyGraph zero(left)=2
+	doWindow/c $"ForceOverTime"
+end
+
+//------------------------------------------------------
+// displays separation distance as a function of time
+function tip_separation()
+	wave tip1c,tip2c
+	duplicate/o tip1c,sep
+	sep = tip2c-tip1c
+	
+	// Makes separation distance histogram
+	Make/N=100/o sep_Hist
+	Histogram/B={0,10,40} sep,sep_Hist
+	
+	// Plots histogram of separation distances
+	display sep_Hist
+	ModifyGraph mode=6,rgb=(0,0,0)	
+	SetAxis/A
+	Label left "Counts"
+	Label bottom "Tip separation (nm)"
+end
+//---------------------------------------------------------------------
+// calculates assembly/disassembly speed of each tip
+function velocities()
+	wave tip1c,tip2c
+	
+	// makes and smoothes velocity waves
+	duplicate/o tip1c,vel1
+	duplicate/o tip2c,vel2
+	differentiate vel1,vel2
+	
+	// graphs each tip velocity
+	dowindow/k/z VelocitiesOverTime
+	display vel1,vel2 // vs time
+	ModifyGraph rgb(vel1)=(65280,0,0),rgb(vel2)=(0,12800,52224)
+	doWindow/c $"VelocitiesOverTime"
+	
+	dowindow/k/z VelvsF
+	display vel1 vs sF1 // vs force
+	setAxis/A
+	ModifyGraph mode=2,rgb=(65280,0,0)
+	Label left "Tip speed (nm s\\S-1\\M)"
+	Label bottom "Force (pN)"
+	ModifyGraph zero(left)=2
+	dowindow/c $"VelvsF"
+	
+end
+
+//-------------------------------------------------------------------
+// Makes a layout with the graphs generated in the functions above
+
+function make_layout()
+	NewLayout /N=Dual_trap_data_analysis
+	AppendLayoutObject graph Graph0
+	AppendLayoutObject graph Graph1
+	AppendLayoutObject graph Graph3
+	AppendLayoutObject graph Graph4
+	AppendLayoutObject graph Graph5
+	AppendLayoutObject graph Graph6
+end
+
+//-------------------------------------------------------
+// graph (x,y) coordinates of beads (time-independent)
+function graph_xy_bead_pos()
+  wave bX1c,bX2c,bY1c,bY2c,bX1u,bX2u,bY1u,bY2u
+  Display bY1c vs bX1c
+  AppendToGraph bY2c vs bX2c
+  AppendToGraph bY1u vs bX1u // unloaded bead 1 positions
+  AppendToGraph bY2u vs bX2u // unloaded bead 2 positions
+  SetAxis left -150,150
+  SetAxis bottom -150,150
+  ModifyGraph mode=2,rgb(bY1c)=(52224,0,0),rgb(bY1u)=(65535,20000,20000),rgb(bY2c)=(0,0,52224),rgb(bY2u)=(20000,20000,65535)
+  ModifyGraph grid=1
+  Label left "\\Z08Y position (nm)"
+  Label bottom "X position (nm)"
+  ModifyGraph standoff=0
+  ModifyGraph fSize=8, btLen=4
+end
+
+//---------------------------------------------------------------
+// Separates single-state experiments from a single file
+
+macro MarkSingleEvent()
+	variable big,small
+  if (EventNumber>=1)
+      DoWindow/F 'BTSep'
+      if ( (stringmatch(CsrInfo(A),"")) || (stringmatch(CsrInfo(B),"")) ) // if both cursors are not on the graph
+        Print "Both cursors are not on the graph"
+      else
+        big = max(xcsr(A),xcsr(B)) // re-store start and end of unloaded data
+        small = min(xcsr(A),xcsr(B))
+        StartTime[EventNumber] = small
+        EndTime[EventNumber] = big
+        data_process_single_event()
+        translate_term() // translate termination event into words
+        
+        TotalEvents += 1      // and update the total event counter
+      endif
+    else
+      Print "Event 0 is reserved for unloaded"
+    endif
+end
+
+//---------------------------------------------------------------
+
+Macro data_process_single_event()
+	isolate_event()
+	
+	Te[EventNumber] = EndTime[EventNumber] - StartTime[EventNumber] // event time
+	v1[EventNumber] = (tip1c_ss[numpnts(tip1c_ss)] - tip1c_ss[0])/Te[EventNumber]
+	v2[EventNumber] = (tip2c_ss[numpnts(tip1c_ss)] - tip2c_ss[0])/Te[EventNumber]
+	kappa[EventNumber] = calculate_coupler_stiffness()
+	Ftot[EventNumber] = mean(sF1_ss)+mean(sF2_ss)
+		
+	doWindow/F 'EventFit'
+		
+	sep_windows(Te[EventNumber],1)
+//	bin_by_force()
+
+end
+
+//----------------------------------------------------------------
+// Isolates single-state event data (tip positions, velocities, forces)
+
+Macro isolate_event()
+	duplicate /O/R=(StartTime[EventNumber],EndTime[EventNumber]) tip1c, tip1c_ss
+		// positions of MT1 during single-state event selected by user
+	duplicate /O/R=(StartTime[EventNumber],EndTime[EventNumber]) tip2c, tip2c_ss
+		// positions of MT2 during single-state event selected by user
+	duplicate /O/R=(StartTime[EventNumber],EndTime[EventNumber]) sF1, sF1_ss
+		// forces on MT1 during single-state event selected by user
+	duplicate /O/R=(StartTime[EventNumber],EndTime[EventNumber]) sF2, sF2_ss
+		// forces on MT2 during single-state event selected by user
+	duplicate /O/R=(StartTime[EventNumber],EndTime[EventNumber]) vel1, vel1_ss
+		// velocities of MT1 during single-state event selected by user
+	duplicate /O/R=(StartTime[EventNumber],EndTime[EventNumber]) vel2, vel2_ss
+		// velocities of MT2 during single-state event selected by user	
+	duplicate /O/R=(StartTime[EventNumber],EndTime[EventNumber]) sep, sep_ss
+		// separation between tips during single-state event selected by user
+		
+	doWindow/k/z EventFit
+	display tip1c_ss,tip2c_ss
+	label bottom "Time (s)"
+	label left "Tip Position (nm)"
+	ModifyGraph rgb(tip2c_ss)=(1,16019,65535)
+	doWindow/c $"EventFit"
+end
+
+//-----------------------------------------------------------------
+function calculate_coupler_stiffness()
+	wave sF1_ss,sF2_ss,tip1c_ss,tip2c_ss
+	variable i // counter
+	
+	make/o/n=(numpnts(sF1_ss)) kwave
+	kwave = abs((sF1_ss-sF2_ss)/(tip1c_ss-tip2c_ss))
+	
+	for(i=0;i<numpnts(kwave);i++)
+		if(numtype(kwave[i]) != 0 || abs(tip1c_ss[i]-tip2c_ss[i]) < 50)
+			kwave[i] = nan
+		endif
+	endfor
+	
+	wavestats/q kwave
+	return(V_avg)
+	
+end
+
+
+//---------------------------------------------------------------------
+
+function bin_by_force()
+	variable i,j // counters
+	variable total1, total2 // number of forces/velocities in a bin
+	variable bin_size = .1
+	variable bin_num = 20
+	wave sF1_ss,sF2_ss,vel1_ss,vel2_ss // Forces and velocities for the selected event
+	
+	make/o/n=(bin_num) F1_bins,v1_bins,F2_bins,v2_bins,force_bins
+	v1_bins = 0
+	F1_bins = 0
+	F2_bins = 0
+	v2_bins = 0
+				
+	for(j=0;j<bin_num;j++) // for each bin
+		total1 = 0
+		total2 = 0
+		for(i=0;i<numpnts(sF1_ss);i++) // for each point in the selected event
+			if(sF1_ss[i] < (1 + bin_size*(j+1)) && sF1_ss[i] > (1 + bin_size*(j)))
+				F1_bins[j] += sF1_ss[i]
+				v1_bins[j] += vel1_ss[i]
+				total1 += 1
+			endif
+			if(sF2_ss[i] < (1 + bin_size*(j+1)) && sF2_ss[i] > (1 + bin_size*(j)))
+				F2_bins[j] += sF2_ss[i]
+				v2_bins[j] += vel2_ss[i]
+				total2 += 1
+			endif
+		endfor
+		if(total1 != 0)
+			v1_bins[j] = v1_bins[j]/total1
+			F1_bins[j] /= total1
+		endif
+		if(total2 != 0)
+			v2_bins[j] = v2_bins[j]/total2
+			F2_bins[j] /= total2
+		endif
+	endfor
+	Display v1_bins vs F1_bins; AppendToGraph v2_bins vs F2_bins
+	ModifyGraph mode=2,lsize=3,rgb(v2_bins)=(1,16019,65535)
+	Label left "Velocity [nm/s]"
+	Label bottom "Force [pN]"
+end
+
+//---------------------------------------------------------------
+// Export analysis to excel
+
+function initialize_analysis()
+  variable i=0
+  variable TotalEvents
+  wave StartTime,Endtime
+  Make/O/N=100 Te,term,v1,v2,kappa,Ftot,catlead,rescuelag // waves of event info
+  Make/o/n=(1000,100) sep_windows_mat // matrix to hold tip seps with 1s intervals
+  Make/o/t/n=100 term_translated // termination type translated to words
+  
+  for(i=0;i<numpnts(Te);i++) // initialize
+  	StartTime[i] = NaN
+  	EndTime[i] = Nan
+  endfor
+  
+  sep_windows_mat = nan
+  Te = NaN // total event time (not counting pause before catastrophe)
+  term = NaN // termination type: other = NaN, detach in DDM = 0, rescue = 1, detach in ADM = 2, 
+  					// catastrophe = 3, low-tension limit = 4
+  term_translated = "" // word version of term
+  v1 = Nan // average velocity of MT 1 
+  v2 = Nan // average velocity of MT 2
+  kappa = Nan // coupler stiffness between MTs
+  Ftot = Nan // sum of force on both MTs
+  catlead = Nan // if applicable, the lead of the MT that catastrophes (nm)
+  rescuelag = Nan // if applicable, the lag of the MT that rescues (nm)
+  TotalEvents = 0
+end
+
+macro MakeDualTrapButtonPanel()
+  doWindow/k/z panel0
+  NewPanel/W=(2750,50,2990,400) as "Dual trap button panel" // xposition, width, yposition,height
+  ModifyPanel cbRGB=(65280,43520,0)  // funky orange background color
+  Button Loader pos={125,120},size={100,30},proc=LoadButton_dual,title="Load Data", win=Panel0
+  Button ImportUnloaded pos={15,120},size={100,30},proc=ImportUnloadedButton,title="Import Unloaded",win=Panel0
+  Button MarkUnloaded pos={125,45},size={100,30},proc=MarkUnloadedButton_dual,title="Mark Unloaded",win=Panel0
+  Button MarkEvent pos={125,155},size={100,30},proc=EventButton_dual,title="Mark Event", win=Panel0
+  Button LoadUnloaded pos={15,45},size={100,30},proc=LoadUnloadedButton_dual,title="Load Unloaded",win=Panel0
+  Button MatchCurs pos={15,155}, size={100,30}, proc= MatchCursButton_dual,title="Match Cursors",win=Panel0 
+  Button CheckEvent pos={70,270}, size={100,30}, proc= CheckEventButton_dual,title="Check Event",win=Panel0 
+  Button FinalVals_dual pos={70,310}, size={100,30}, proc= FinalValsButton_dual,title="Final Values",win=Panel0
+
+  SetVariable setvar0 pos={30,220},size={180,30},title="Current Event",value= EventNumber,win=Panel0
+  PopupMenu TermTypeM mode=1, pos={30,195}, size={200,30}, proc=TermTypeMenu_dual,title="Event Termination",win=Panel0, value="other;detach in DDM;rescue;detach in ADM;catastrophe;low-tension violation"
+  SetDrawEnv textrgb= (0,0,0),fsize=14,fstyle=1  // black text
+  DrawText 50,20,"Dual Trap Analysis"
+  DrawText 40,40, "For the file with unloaded data"
+  DrawText 40,120, "For each single state event"
+end
+
+Function ImportUnloadedButton(ctrlName) : ButtonControl
+  String ctrlName
+  transferUnloaded()
+End
+
+Function EventButton_dual(ctrlName) : ButtonControl
+  String ctrlName
+  ControlInfo IsDataOpenLoop // this bit checks the status of the "Open Loop?" checkbox and sets global variable OpenLoop
+  NVAR OpenLoop
+  OpenLoop = V_value
+  execute "MarkSingleEvent()"
+End
+
+Function LoadButton_dual(ctrlName) : ButtonControl
+  String ctrlName
+  execute "LoadDualTrapData()"
+End
+
+Function LoadUnloadedButton_dual(ctrlName) : ButtonControl
+  String ctrlName
+  unloaded_bead_graph()
+End
+
+Function MarkUnloadedButton_dual(ctrlName) : ButtonControl
+  String ctrlName
+  unloaded_bead_calc()
+End
+
+Function MatchCursButton_dual(ctrlName) : ButtonControl
+  String ctrlName
+  Execute "MatchCursors_dual()" 
+End
+
+Function CheckEventButton_dual(ctrlName) : ButtonControl
+	String ctrlName
+	Execute "CheckEvent_dual()"
+End
+
+Function FinalValsButton_dual(ctrlName) : ButtonControl
+	String ctrlName
+	Execute "finalvals_dual()"
+end
+
+Function TermTypeMenu_dual(ctrlName,popNum,popStr) : PopupMenuControl
+  String ctrlName
+  Variable popNum
+  String popStr
+  String dummystring = "SetTermType_dual("+num2str(popNum)+")"
+  Execute dummystring
+End
+//---------------------------------------
+macro SetTermType_dual(popNum)
+  variable popNum
+  silent 1; pauseupdate
+  if (popNum == 1) // user specified "other"
+    term[EventNumber] = NaN
+  else
+    if (popNum == 2) // user specified "detach in DDM"
+      term[EventNumber] = 0
+    else 
+      if (popNum ==3) // user specified "rescue"
+      	term[EventNumber] = 1
+      else
+      	if (popNum == 4) // user specified "detach in ADM"
+      		term[EventNumber] = 2
+      	else
+      		if(popNum == 5) // user specified "catastrophe"
+      			term[EventNumber] = 3
+      		else // user specified "low-tension limit"
+      	      term[EventNumber] = 4
+      	   endif
+      	endif
+      endif
+    endif
+  endif
+end
+//----------------------------------------------------------------------------------------------------------------------------//
+
+macro CheckEvent_dual()
+	if ((EventNumber <= TotalEvents) && (EventNumber >= 1)) // if you're not trying to check an event that doesn't exist
+    DoWindow/F 'BTSep'
+    Label bottom "Total Event Selected = "+num2str(TotalEvents)
+    Cursor  A,bX1c_unloaded,StartTime[EventNumber]
+    Cursor  B,bX1c_unloaded,EndTime[EventNumber]
+    MatchCursors_dual()  // updates cursors on StagePos and moves cursors to appropriate waves
+    UpdateTermTypeMenu_dual() // updates value displayed on "event termination" pull-down menu
+	 data_process_single_event()
+	   
+  else
+    print "Event number "+num2str(EventNumber)+" does not exist"
+  endif
+	
+end
+
+//-------------------------------------
+function translate_term()
+	wave term,catlead,rescuelag,sep_ss
+	wave/T term_translated
+	variable/G EventNumber
+	
+	 // store termination type
+    if(term[EventNumber] == 0) // detach in DDM
+    	term_translated[EventNumber] = "detach in DDM"
+    elseif(term[EventNumber] == 1) // rescue
+    	term_translated[EventNumber] = "rescue"
+    	rescuelag[EventNumber] = abs(sep_ss[numpnts(sep_ss)])
+    elseif(term[EventNumber] == 2) // detach in ADM
+    	term_translated[EventNumber] = "detach in ADM"
+    elseif(term[EventNumber] == 3) //catastrophe
+  		catlead[EventNumber] = abs(sep_ss[numpnts(sep_ss)])
+  		term_translated[EventNumber] = "catastrophe"
+  	 elseif(term[EventNumber] == 4) // low-tension limit
+  	 	term_translated[EventNumber] = "low-tension limit"
+  	 elseif(numtype(term[EventNumber]) == 2) // Nan
+  	 	term_translated[EventNumber] = ""
+  	 endif
+end
+
+//-------------------------------------
+
+macro MatchCursors_dual()
+  variable startt,endt
+  startt = min(xcsr(A),xcsr(B))
+  endt = max(xcsr(A),xcsr(B))
+  
+  // Place cursors on relevant traces within BTSep and StagePos plots
+  DoWindow/F 'BTSep'
+  Cursor  A,bX1c_unloaded,startt
+  Cursor  B,bX1c_unloaded,endt
+  
+  DoWindow/F 'StagePos'
+  Cursor  A,tip1c,startt
+  Cursor  B,tip1c,endt
+end
+//--------------------------------------
+
+//----------------------------------------------------------------------
+macro FinalVals_dual()
+	
+  DoWindow/k/z 'FinalVals'  
+  edit Te,term_translated,v1,v2,kappa,Ftot,catlead,rescuelag
+  ModifyTable size=8,width=45
+  DoWindow/c $"FinalVals"
+  
+  DoWindow/k/z 'TipSepMatrix'
+  edit sep_windows_mat
+  DoWindow/c $"TipSepMatrix"
+end
+//-----------------------------------------------------------------------
+function sep_windows(n,size)
+	variable n // n windows
+	variable size // size of each window [s]	
+	
+	wave sep_windows_mat,StartTime,sep_ss
+	variable/g EventNumber
+	variable i // counter
+	
+	for(i=0;i<n;i++)
+		sep_windows_mat[i][(EventNumber-1)] = abs(sep_ss[i*size/.005])
+	endfor
+
+end
+
+//---------------------------------------------
+macro UpdateTermTypeMenu_dual()
+  silent 1; pauseupdate
+  variable dummy
+  if (numtype(term[EventNumber]) == 2) // if term value for current event is NaN, specifying "other"
+    dummy = 1
+  else
+    dummy = term[EventNumber]+2
+  endif
+  PopupMenu TermTypeM mode=(dummy),win=Panel0 // updates value displayed in pull down menu
+end
+
+//-------------------------------------------
+// time to set distances
+function time_to_sep_windows(n,size)
+	variable n // n windows
+	variable size // size of each window [nm]
+	make/o/n=(n,2) time_to_sep_windows_mat = 0
+	
+	variable i // counter
+	for(i=0;i<n;i++)
+		time_to_sep_windows_mat[i][0] = i*size // .005 s is the increment between each measurement
+		time_to_sep_windows_mat[i][1] = time_to_sep_d(i*size)*.005
+	endfor
+	Edit time_to_sep_windows_mat
+end
+
+//---------------------------------
+function time_to_sep_d(d)
+	variable d
+	wave sep_ss
+	variable t // answer
+	variable i // counter
+	for(i=0;i<numpnts(sep_ss);i++)
+		if(abs(sep_ss[i]) > d) // abs because either tip could be ahead
+			t = i
+			break
+		endif
+	endfor
+	
+	return t
+end
